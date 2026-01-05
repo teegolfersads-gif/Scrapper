@@ -1,1 +1,399 @@
 
+name: Fetch latest news
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install beautifulsoup4
+
+      - name: Fetch news JSON (all sources, dedup by URL)
+        run: |
+          python - <<'PY'
+          import json
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from bs4 import BeautifulSoup
+          from urllib.parse import urljoin, urlparse
+
+          MAX_PER_CATEGORY = 200
+
+          # ---- Prothom Alo API categories ----
+          API_SLUGS = {
+              "latest-all": "latest",
+              "bangladesh-all": "bangladesh",
+              "politics-all": "politics",
+              "world-all": "world",
+              "business-all": "business",
+              "sports-all": "sports",
+              "entertainment-all": "entertainment",
+              "chakri-all": "jobs",
+              "opinion": "opinion",
+              "world-business": "world-business",
+              "sports/cricket": "cricket",
+              "sports/football": "football",
+          }
+
+          MEDIA_BASE = "https://media.prothomalo.com/"
+          HEADERS = {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+              "Accept": "application/json",
+          }
+
+          def fetch_api(slug):
+              url = f"https://www.prothomalo.com/api/v1/collections/{slug}"
+              try:
+                  req = urllib.request.Request(url, headers=HEADERS)
+                  with urllib.request.urlopen(req, timeout=20) as resp:
+                      return json.load(resp)
+              except Exception as e:
+                  print(f"ProthomAlo fetch failed for {slug}: {e}")
+                  return {"items": []}
+
+          def image_key(story):
+              hero = story.get("hero-image-s3-key")
+              if hero:
+                  return hero
+              for card in story.get("cards", []):
+                  for el in card.get("story-elements", []):
+                      if el.get("type") == "image" and el.get("image-s3-key"):
+                          return el["image-s3-key"]
+              return None
+
+          def image_url_from_key(key):
+              if not key:
+                  return None
+              return f"{MEDIA_BASE}{key}?auto=format,compress"
+
+          def extract_stories_api(data):
+              stories = []
+              for item in data.get("items", []):
+                  story = item.get("story")
+                  if not story:
+                      continue
+                  headline = story.get("headline")
+                  if isinstance(headline, list):
+                      headline = headline[0] if headline else None
+                  if not headline or len(headline) < 22:
+                      continue
+                  published_ms = story.get("published-at") or story.get("last-published-at")
+                  published_at = None
+                  if published_ms:
+                      try:
+                          published_at = datetime.fromtimestamp(published_ms / 1000, tz=timezone.utc).isoformat()
+                      except Exception:
+                          published_at = None
+                  summary = story.get("summary") or story.get("seo", {}).get("meta-description")
+                  key = image_key(story)
+                  stories.append({
+                      "headline": headline,
+                      "url": story.get("url"),
+                      "published_at": published_at,
+                      "summary": summary,
+                      "image_s3_key": key,
+                      "image_url": image_url_from_key(key),
+                  })
+              return stories
+
+          # ---- HTML sources (grouped by category) ----
+          HTML_SOURCES = [
+              # Latest
+              {"category": "latest", "url": "https://www.bd-pratidin.com/online/todaynews", "domain": "www.bd-pratidin.com"},
+              {"category": "latest", "url": "https://www.ittefaq.com.bd/latest-news", "domain": "www.ittefaq.com.bd"},
+              {"category": "latest", "url": "https://dailynayadiganta.com/latest", "domain": "dailynayadiganta.com"},
+              {"category": "latest", "url": "https://dailynayadiganta.com/bangladesh", "domain": "dailynayadiganta.com"},
+              {"category": "latest", "url": "https://www.jugantor.com/latest", "domain": "www.jugantor.com"},
+              {"category": "latest", "url": "https://samakal.com/latest/news", "domain": "samakal.com"},
+
+              # Bangladesh
+              {"category": "bangladesh", "url": "https://www.bd-pratidin.com/national", "domain": "www.bd-pratidin.com"},
+              {"category": "bangladesh", "url": "https://www.ittefaq.com.bd/national", "domain": "www.ittefaq.com.bd"},
+              {"category": "bangladesh", "url": "https://www.ittefaq.com.bd/country", "domain": "www.ittefaq.com.bd"},
+              {"category": "bangladesh", "url": "https://www.amarsangbad.com/bangladesh", "domain": "www.amarsangbad.com"},
+              {"category": "bangladesh", "url": "https://www.amarsangbad.com/national", "domain": "www.amarsangbad.com"},
+              {"category": "bangladesh", "url": "https://www.amarsangbad.com/country", "domain": "www.amarsangbad.com"},
+              {"category": "bangladesh", "url": "https://www.jugantor.com/national", "domain": "www.jugantor.com"},
+              {"category": "bangladesh", "url": "https://www.jugantor.com/country-news", "domain": "www.jugantor.com"},
+              {"category": "bangladesh", "url": "https://samakal.com/bangladesh", "domain": "samakal.com"},
+              {"category": "bangladesh", "url": "https://samakal.com/whole-country", "domain": "samakal.com"},
+
+              # Politics
+              {"category": "politics", "url": "https://www.bd-pratidin.com/current-politics", "domain": "www.bd-pratidin.com"},
+              {"category": "politics", "url": "https://www.ittefaq.com.bd/politics", "domain": "www.ittefaq.com.bd"},
+              {"category": "politics", "url": "https://www.amarsangbad.com/politics", "domain": "www.amarsangbad.com"},
+              {"category": "politics", "url": "https://www.jugantor.com/politics", "domain": "www.jugantor.com"},
+              {"category": "politics", "url": "https://samakal.com/politics", "domain": "samakal.com"},
+
+              # World
+              {"category": "world", "url": "https://www.bd-pratidin.com/international-news", "domain": "www.bd-pratidin.com"},
+              {"category": "world", "url": "https://www.ittefaq.com.bd/world-news", "domain": "www.ittefaq.com.bd"},
+              {"category": "world", "url": "https://dailynayadiganta.com/international", "domain": "dailynayadiganta.com"},
+              {"category": "world", "url": "https://www.amarsangbad.com/international", "domain": "www.amarsangbad.com"},
+              {"category": "world", "url": "https://www.jugantor.com/international", "domain": "www.jugantor.com"},
+              {"category": "world", "url": "https://samakal.com/international", "domain": "samakal.com"},
+
+              # Business
+              {"category": "business", "url": "https://www.ittefaq.com.bd/business", "domain": "www.ittefaq.com.bd"},
+              {"category": "business", "url": "https://dailynayadiganta.com/economy", "domain": "dailynayadiganta.com"},
+              {"category": "business", "url": "https://www.amarsangbad.com/economy", "domain": "www.amarsangbad.com"},
+              {"category": "business", "url": "https://www.jugantor.com/economics", "domain": "www.jugantor.com"},
+              {"category": "business", "url": "https://samakal.com/economics", "domain": "samakal.com"},
+
+              # Opinion
+              {"category": "opinion", "url": "http://dailynayadiganta.com/opinions/", "domain": "dailynayadiganta.com"},
+              {"category": "opinion", "url": "https://www.amarsangbad.com/opinion", "domain": "www.amarsangbad.com"},
+              {"category": "opinion", "url": "https://samakal.com/opinion", "domain": "samakal.com"},
+
+              # Sports
+              {"category": "sports", "url": "https://www.ittefaq.com.bd/sports", "domain": "www.ittefaq.com.bd"},
+              {"category": "sports", "url": "https://dailynayadiganta.com/sports", "domain": "dailynayadiganta.com"},
+              {"category": "sports", "url": "https://www.amarsangbad.com/sports", "domain": "www.amarsangbad.com"},
+              {"category": "sports", "url": "https://www.jugantor.com/sports", "domain": "www.jugantor.com"},
+              {"category": "sports", "url": "https://samakal.com/sports", "domain": "samakal.com"},
+
+              # Entertainment
+              {"category": "entertainment", "url": "https://www.bd-pratidin.com/entertainment", "domain": "www.bd-pratidin.com"},
+              {"category": "entertainment", "url": "https://www.ittefaq.com.bd/entertainment", "domain": "www.ittefaq.com.bd"},
+              {"category": "entertainment", "url": "https://dailynayadiganta.com/entertainment", "domain": "dailynayadiganta.com"},
+              {"category": "entertainment", "url": "https://www.amarsangbad.com/entertainment", "domain": "www.amarsangbad.com"},
+              {"category": "entertainment", "url": "https://www.jugantor.com/entertainment", "domain": "www.jugantor.com"},
+              {"category": "entertainment", "url": "https://samakal.com/entertainment", "domain": "samakal.com"},
+
+              # Jobs
+              {"category": "jobs", "url": "https://www.bd-pratidin.com/career", "domain": "www.bd-pratidin.com"},
+              {"category": "jobs", "url": "https://www.ittefaq.com.bd/jobs", "domain": "www.ittefaq.com.bd"},
+              {"category": "jobs", "url": "https://www.amarsangbad.com/job", "domain": "www.amarsangbad.com"},
+              {"category": "jobs", "url": "https://www.jugantor.com/job-seek", "domain": "www.jugantor.com"},
+              {"category": "jobs", "url": "https://samakal.com/chakri", "domain": "samakal.com"},
+
+              # Election
+              {"category": "election", "url": "https://www.bd-pratidin.com/election", "domain": "www.bd-pratidin.com"},
+              {"category": "election", "url": "https://www.amarsangbad.com/election", "domain": "www.amarsangbad.com"},
+
+              # City
+              {"category": "city", "url": "https://www.bd-pratidin.com/city-news", "domain": "www.bd-pratidin.com"},
+
+              # Campus / Education
+              {"category": "campus", "url": "https://www.bd-pratidin.com/campus-online", "domain": "www.bd-pratidin.com"},
+              {"category": "campus", "url": "https://www.amarsangbad.com/education", "domain": "www.amarsangbad.com"},
+
+              # Tech
+              {"category": "tech", "url": "https://www.bd-pratidin.com/tech-world", "domain": "www.bd-pratidin.com"},
+              {"category": "tech", "url": "https://www.ittefaq.com.bd/tech", "domain": "www.ittefaq.com.bd"},
+              {"category": "tech", "url": "https://dailynayadiganta.com/science-technology", "domain": "dailynayadiganta.com"},
+              {"category": "tech", "url": "https://www.amarsangbad.com/science-and-technology", "domain": "www.amarsangbad.com"},
+              {"category": "tech", "url": "https://www.jugantor.com/tech", "domain": "www.jugantor.com"},
+              {"category": "tech", "url": "https://samakal.com/technology", "domain": "samakal.com"},
+          ]
+
+          HTML_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+          def fetch_html(url):
+              req = urllib.request.Request(url, headers=HTML_HEADERS)
+              with urllib.request.urlopen(req, timeout=20) as resp:
+                  return resp.read()
+
+          def first_src_from_img(img_tag):
+              if not img_tag:
+                  return None
+              srcset = img_tag.get("data-srcset") or img_tag.get("srcset")
+              if srcset:
+                  first = srcset.split(",")[0].strip().split()[0]
+                  if first:
+                      return first
+              for attr in ("data-src", "data-original", "src"):
+                  val = img_tag.get(attr)
+                  if val:
+                      return val
+              return None
+
+          def same_domain(href, domain):
+              if not href:
+                  return False
+              if href.startswith("/"):
+                  return True
+              netloc = urlparse(href).netloc
+              # accept exact domain or subdomains
+              return (netloc == "" or netloc == domain or netloc.endswith("." + domain))
+
+          def fetch_article_meta(url):
+              try:
+                  req = urllib.request.Request(url, headers=HTML_HEADERS)
+                  with urllib.request.urlopen(req, timeout=12) as resp:
+                      html = resp.read()
+                  doc = BeautifulSoup(html, "html.parser")
+                  og_img = doc.find("meta", property="og:image") or doc.find("meta", attrs={"name": "og:image"})
+                  image_url = og_img["content"] if og_img and og_img.get("content") else None
+
+                  published_at = None
+                  for meta_name in [
+                      ("meta", {"property": "article:published_time"}),
+                      ("meta", {"name": "pubdate"}),
+                      ("meta", {"itemprop": "datePublished"}),
+                  ]:
+                      tag = doc.find(meta_name[0], attrs=meta_name[1])
+                      if tag and tag.get("content"):
+                          published_at = tag["content"]
+                          break
+                  if not published_at:
+                      time_tag = doc.find("time")
+                      if time_tag and time_tag.get("datetime"):
+                          published_at = time_tag["datetime"]
+
+                  summary = None
+                  for p in doc.find_all("p"):
+                      txt = p.get_text(strip=True)
+                      if txt and len(txt) > 40:
+                          summary = txt
+                          break
+
+                  return {"image_url": image_url, "published_at": published_at, "summary": summary}
+              except Exception as e:
+                  print(f"  meta fetch failed for {url}: {e}")
+              return {"image_url": None, "published_at": None, "summary": None}
+
+          def scrape_site(conf, max_items=10):
+              html = fetch_html(conf["url"])
+              soup = BeautifulSoup(html, "html.parser")
+              items = []
+              seen = set()
+
+              containers = soup.select("article, div.item, div.list-item, div.news-item, div.post, div.news-box, li")
+
+              def handle_anchor(a):
+                  href = a.get("href")
+                  text = a.get_text(strip=True)
+                  if not href or not text or len(text) < 22:
+                      return None
+                  if not same_domain(href, conf["domain"]):
+                      return None
+                  full_href = urljoin(conf["url"], href)
+                  if full_href in seen:
+                      return None
+                  if full_href.endswith("#") or ".pdf" in full_href:
+                      return None
+                  img_url = None
+                  parent = a.parent
+                  img = parent.find("img") if parent else None
+                  if not img:
+                      img = a.find("img")
+                  raw_img = first_src_from_img(img) if img else None
+                  if raw_img:
+                      img_url = urljoin(conf["url"], raw_img)
+                  meta = fetch_article_meta(full_href)
+                  if not img_url:
+                      img_url = meta.get("image_url")
+                      if img_url:
+                          img_url = urljoin(conf["url"], img_url)
+                  seen.add(full_href)
+                  return {
+                      "headline": text,
+                      "url": full_href,
+                      "published_at": meta.get("published_at"),
+                      "summary": meta.get("summary"),
+                      "image_url": img_url,
+                  }
+
+              for c in containers:
+                  a = c.find("a")
+                  if not a:
+                      continue
+                  entry = handle_anchor(a)
+                  if entry:
+                      items.append(entry)
+                  if len(items) >= max_items:
+                      break
+
+              if len(items) < max_items:
+                  for a in soup.find_all("a"):
+                      if len(items) >= max_items:
+                          break
+                      entry = handle_anchor(a)
+                      if entry:
+                          items.append(entry)
+
+              return items
+
+          # ---- Run all fetches into category buckets ----
+          categories = {}
+
+          for slug, cat in API_SLUGS.items():
+              data = fetch_api(slug)
+              categories.setdefault(cat, []).extend(extract_stories_api(data))
+
+          for conf in HTML_SOURCES:
+              try:
+                  categories.setdefault(conf["category"], []).extend(scrape_site(conf))
+              except Exception as e:
+                  print(f"HTML scrape failed for {conf['url']}: {e}")
+
+          # Merge with existing file to avoid duplicates across runs
+          existing_sections = {}
+          if Path("news_sections.json").exists():
+              try:
+                  existing = json.loads(Path("news_sections.json").read_text(encoding="utf-8"))
+                  existing_sections = existing.get("sections", {})
+              except Exception as e:
+                  print(f"Failed to load existing news_sections.json: {e}")
+
+          def dedupe_by_url(new_items, old_items):
+              out = []
+              seen = set()
+              for src in (new_items + old_items):
+                  url = src.get("url")
+                  if not url or url in seen:
+                      continue
+                  seen.add(url)
+                  out.append(src)
+                  if len(out) >= MAX_PER_CATEGORY:
+                      break
+              return out
+
+          merged_sections = {}
+          for cat, new_list in categories.items():
+              old_list = existing_sections.get(cat, [])
+              merged_sections[cat] = dedupe_by_url(new_list, old_list)
+
+          fetched_at = datetime.now(timezone.utc).isoformat()
+
+          with open("news_sections.json", "w", encoding="utf-8") as f:
+              json.dump({"fetched_at": fetched_at, "sections": merged_sections}, f, ensure_ascii=False, indent=2)
+
+          with open("latest_news.json", "w", encoding="utf-8") as f:
+              json.dump({"fetched_at": fetched_at, "stories": merged_sections.get("latest", [])}, f, ensure_ascii=False, indent=2)
+
+          print("Wrote sections:", ", ".join(f"{k} ({len(v)} stories)" for k, v in merged_sections.items()))
+          PY
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add news_sections.json latest_news.json
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "chore: update news sections"
+          git push
